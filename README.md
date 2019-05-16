@@ -225,6 +225,7 @@ Use the stack template to initialize a project and get a project skeleton with:
 To get started, run the following command:
 
 ```sh
-stack new --resolver=lts-13.0 --solver polysemy-base https://github.com/isovector/polysemy/raw/master/polysemy-template.hsfiles
+stack new --resolver nightly-2019-05-20 polysemy-base https://github.com/isovector/polysemy/raw/master/polysemy-template.hsfiles
 ```
-Substituting `--resolver` and project name as needed.
+For now, you will need to use one of the stackage nightly resolvers, but eventually `polysemy` will make its way
+into the LTS resolvers. You can substitute the `--resolver` and project name as needed.
