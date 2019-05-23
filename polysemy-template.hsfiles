@@ -43,7 +43,7 @@ main = defaultMain
 {-# START_FILE src/Main.hs #-}
   {-# LANGUAGE TemplateHaskell #-}
   module Main where
-  import Prelude hiding (throw, catch, bracket)
+
   import Polysemy
   import Polysemy.Input
   import Polysemy.Output
