@@ -9,11 +9,15 @@ module Polysemy.State
   , gets
   , put
   , modify
+  , modify'
 
     -- * Interpretations
   , runState
+  , evalState
   , runLazyState
-  , runStateInIORef
+  , evalLazyState
+  , runStateIORef
+  , stateToIO
 
     -- * Interoperation with MTL
   , hoistStateIntoStateT
@@ -43,7 +47,7 @@ data State s m a where
 makeSem ''State
 
 
-gets :: Member (State s) r => (s -> a) -> Sem r a
+gets :: forall s a r. Member (State s) r => (s -> a) -> Sem r a
 gets f = fmap f get
 {-# INLINABLE gets #-}
 
@@ -53,6 +57,15 @@ modify f = do
   s <- get
   put $ f s
 {-# INLINABLE modify #-}
+
+------------------------------------------------------------------------------
+-- | A variant of 'modify' in which the computation is strict in the
+-- new state.
+modify' :: Member (State s) r => (s -> s) -> Sem r ()
+modify' f = do
+  s <- get
+  put $! f s
+{-# INLINABLE modify' #-}
 
 
 ------------------------------------------------------------------------------
@@ -65,6 +78,15 @@ runState = stateful $ \case
 
 
 ------------------------------------------------------------------------------
+-- | Run a 'State' effect with local state.
+--
+-- @since 1.0.0.0
+evalState :: s -> Sem (State s ': r) a -> Sem r a
+evalState s = fmap snd . runState s
+{-# INLINE evalState #-}
+
+
+------------------------------------------------------------------------------
 -- | Run a 'State' effect with local state, lazily.
 runLazyState :: s -> Sem (State s ': r) a -> Sem r (s, a)
 runLazyState = lazilyStateful $ \case
@@ -72,22 +94,68 @@ runLazyState = lazilyStateful $ \case
   Put s -> const $ pure (s, ())
 {-# INLINE[3] runLazyState #-}
 
+------------------------------------------------------------------------------
+-- | Run a 'State' effect with local state, lazily.
+--
+-- @since 1.0.0.0
+evalLazyState :: s -> Sem (State s ': r) a -> Sem r a
+evalLazyState s = fmap snd . runLazyState s
+{-# INLINE evalLazyState #-}
+
 
 ------------------------------------------------------------------------------
 -- | Run a 'State' effect by transforming it into operations over an 'IORef'.
 --
--- @since 0.1.2.0
-runStateInIORef
+-- /Note/: This is not safe in a concurrent setting, as 'modify' isn't atomic.
+-- If you need operations over the state to be atomic,
+-- use 'Polysemy.AtomicState.runAtomicStateIORef' or
+-- 'Polysemy.AtomicState.runAtomicStateTVar' instead.
+--
+-- @since 1.0.0.0
+runStateIORef
     :: forall s r a
-     . Member (Lift IO) r
+     . Member (Embed IO) r
     => IORef s
     -> Sem (State s ': r) a
     -> Sem r a
-runStateInIORef ref = interpret $ \case
-  Get   -> sendM $ readIORef ref
-  Put s -> sendM $ writeIORef ref s
-{-# INLINE runStateInIORef #-}
+runStateIORef ref = interpret $ \case
+  Get   -> embed $ readIORef ref
+  Put s -> embed $ writeIORef ref s
+{-# INLINE runStateIORef #-}
 
+--------------------------------------------------------------------
+-- | Run an 'State' effect in terms of operations
+-- in 'IO'.
+--
+-- Internally, this simply creates a new 'IORef', passes it to
+-- 'runStateIORef', and then returns the result and the final value
+-- of the 'IORef'.
+--
+-- /Note/: This is not safe in a concurrent setting, as 'modify' isn't atomic.
+-- If you need operations over the state to be atomic,
+-- use 'Polysemy.AtomicState.atomicStateToIO' instead.
+--
+-- /Beware/: As this uses an 'IORef' internally,
+-- all other effects will have local
+-- state semantics in regards to 'State' effects
+-- interpreted this way.
+-- For example, 'Polysemy.Error.throw' and 'Polysemy.Error.catch' will
+-- never revert 'put's, even if 'Polysemy.Error.runError' is used
+-- after 'stateToIO'.
+--
+-- @since 1.2.0.0
+stateToIO
+    :: forall s r a
+     . Member (Embed IO) r
+    => s
+    -> Sem (State s ': r) a
+    -> Sem r (s, a)
+stateToIO s sem = do
+  ref <- embed $ newIORef s
+  res <- runStateIORef ref sem
+  end <- embed $ readIORef ref
+  return (end, res)
+{-# INLINE stateToIO #-}
 
 ------------------------------------------------------------------------------
 -- | Hoist a 'State' effect into a 'S.StateT' monad transformer. This can be
@@ -105,15 +173,10 @@ hoistStateIntoStateT (Sem m) = m $ \u ->
                       (\(s', m') -> fmap swap
                                   $ S.runStateT m' s')
                       (Just . snd)
-              $ hoist hoistStateIntoStateT_b x
-    Right (Yo Get z _ y _)     -> fmap (y . (<$ z)) $ S.get
-    Right (Yo (Put s) z _ y _) -> fmap (y . (<$ z)) $ S.put s
+              $ hoist hoistStateIntoStateT x
+    Right (Weaving Get z _ y _)     -> fmap (y . (<$ z)) $ S.get
+    Right (Weaving (Put s) z _ y _) -> fmap (y . (<$ z)) $ S.put s
 {-# INLINE hoistStateIntoStateT #-}
-
-
-hoistStateIntoStateT_b :: Sem (State s ': r) a -> S.StateT s (Sem r) a
-hoistStateIntoStateT_b = hoistStateIntoStateT
-{-# NOINLINE hoistStateIntoStateT_b #-}
 
 
 {-# RULES "runState/reinterpret"

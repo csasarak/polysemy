@@ -13,7 +13,7 @@ module Polysemy.Reader
   , runReader
 
     -- * Interpretations for Other Effects
-  , runInputAsReader
+  , inputToReader
   ) where
 
 import Polysemy
@@ -29,7 +29,7 @@ data Reader i m a where
 makeSem ''Reader
 
 
-asks :: Member (Reader i) r => (i -> j) -> Sem r j
+asks :: forall i j r. Member (Reader i) r => (i -> j) -> Sem r j
 asks f = f <$> ask
 {-# INLINABLE asks #-}
 
@@ -41,18 +41,16 @@ runReader i = interpretH $ \case
   Ask -> pureT i
   Local f m -> do
     mm <- runT m
-    raise $ runReader_b (f i) mm
+    raise $ runReader (f i) mm
 {-# INLINE runReader #-}
-
-runReader_b :: i -> Sem (Reader i ': r) a -> Sem r a
-runReader_b = runReader
-{-# NOINLINE runReader_b #-}
 
 
 ------------------------------------------------------------------------------
 -- | Transform an 'Input' effect into a 'Reader' effect.
-runInputAsReader :: Member (Reader i) r => Sem (Input i ': r) a -> Sem r a
-runInputAsReader = interpret $ \case
+--
+-- @since 1.0.0.0
+inputToReader :: Member (Reader i) r => Sem (Input i ': r) a -> Sem r a
+inputToReader = interpret $ \case
   Input -> ask
-{-# INLINE runInputAsReader #-}
+{-# INLINE inputToReader #-}
 

@@ -11,17 +11,19 @@ module Polysemy.Internal
   , Member
   , Members
   , send
-  , sendM
+  , embed
   , run
   , runM
   , raise
   , raiseUnder
   , raiseUnder2
   , raiseUnder3
-  , Lift (..)
+  , subsume
+  , Embed (..)
   , usingSem
   , liftSem
   , hoistSem
+  , InterpreterFor
   , (.@)
   , (.@@)
   ) where
@@ -33,12 +35,18 @@ import Control.Monad.Fix
 import Control.Monad.IO.Class
 import Data.Functor.Identity
 import Data.Kind
+import Polysemy.Embed.Type
+import Polysemy.Fail.Type
 import Polysemy.Internal.Fixpoint
-import Polysemy.Internal.Lift
 import Polysemy.Internal.NonDet
 import Polysemy.Internal.PluginLookup
 import Polysemy.Internal.Union
 
+
+-- $setup
+-- >>> import Data.Function
+-- >>> import Polysemy.State
+-- >>> import Polysemy.Error
 
 ------------------------------------------------------------------------------
 -- | The 'Sem' monad handles computations of arbitrary extensible effects.
@@ -54,15 +62,19 @@ import Polysemy.Internal.Union
 -- interpretations (and others that you might add) may be used interchangably
 -- without needing to write any newtypes or 'Monad' instances. The only
 -- change needed to swap interpretations is to change a call from
--- 'Polysemy.Error.runError' to 'Polysemy.Error.runErrorInIO'.
+-- 'Polysemy.Error.runError' to 'Polysemy.Error.errorToIOFinal'.
 --
 -- The effect stack @r@ can contain arbitrary other monads inside of it. These
--- monads are lifted into effects via the 'Lift' effect. Monadic values can be
--- lifted into a 'Sem' via 'sendM'.
+-- monads are lifted into effects via the 'Embed' effect. Monadic values can be
+-- lifted into a 'Sem' via 'embed'.
+--
+-- Higher-order actions of another monad can be lifted into higher-order actions
+-- of 'Sem' via the 'Polysemy.Final' effect, which is more powerful
+-- than 'Embed', but also less flexible to interpret.
 --
 -- A 'Sem' can be interpreted as a pure value (via 'run') or as any
--- traditional 'Monad' (via 'runM'). Each effect @E@ comes equipped with some
--- interpreters of the form:
+-- traditional 'Monad' (via 'runM' or 'Polysemy.runFinal').
+-- Each effect @E@ comes equipped with some interpreters of the form:
 --
 -- @
 -- runE :: 'Sem' (E ': r) a -> 'Sem' r a
@@ -72,9 +84,57 @@ import Polysemy.Internal.Union
 -- is the order in which you call the interpreters that determines the
 -- monomorphic representation of the @r@ parameter.
 --
+-- Order of interpreters can be important - it determines behaviour of effects
+-- that manipulate state or change control flow. For example, when
+-- interpreting this action:
+--
+-- >>> :{
+--   example :: Members '[State String, Error String] r => Sem r String
+--   example = do
+--     put "start"
+--     let throwing, catching :: Members '[State String, Error String] r => Sem r String
+--         throwing = do
+--           modify (++"-throw")
+--           throw "error"
+--           get
+--         catching = do
+--           modify (++"-catch")
+--           get
+--     catch @String throwing (\ _ -> catching)
+-- :}
+--
+-- when handling 'Polysemy.Error.Error' first, state is preserved after error
+-- occurs:
+--
+-- >>> :{
+--   example
+--     & runError
+--     & fmap (either id id)
+--     & evalState ""
+--     & runM
+--     & (print =<<)
+-- :}
+-- "start-throw-catch"
+--
+-- while handling 'Polysemy.State.State' first discards state in such cases:
+--
+-- >>> :{
+--   example
+--     & evalState ""
+--     & runError
+--     & fmap (either id id)
+--     & runM
+--     & (print =<<)
+-- :}
+-- "start-catch"
+--
+-- A good rule of thumb is to handle effects which should have \"global\"
+-- behaviour over other effects later in the chain.
+--
 -- After all of your effects are handled, you'll be left with either
--- a @'Sem' '[] a@ or a @'Sem' '[ 'Lift' m ] a@ value, which can be
--- consumed respectively by 'run' and 'runM'.
+-- a @'Sem' '[] a@, a @'Sem' '[ 'Embed' m ] a@, or a @'Sem' '[ 'Polysemy.Final' m ] a@
+-- value, which can be consumed respectively by 'run', 'runM', and
+-- 'Polysemy.runFinal'.
 --
 -- ==== Examples
 --
@@ -211,10 +271,7 @@ instance Monad (Sem f) where
 instance (Member NonDet r) => Alternative (Sem r) where
   empty = send Empty
   {-# INLINE empty #-}
-  a <|> b = do
-    send (Choose id) >>= \case
-      False -> a
-      True  -> b
+  a <|> b = send (Choose a b)
   {-# INLINE (<|>) #-}
 
 -- | @since 0.2.1.0
@@ -222,17 +279,18 @@ instance (Member NonDet r) => MonadPlus (Sem r) where
   mzero = empty
   mplus = (<|>)
 
--- | @since 0.2.1.0
-instance (Member NonDet r) => MonadFail (Sem r) where
-  fail = const empty
+-- | @since 1.1.0.0
+instance (Member Fail r) => MonadFail (Sem r) where
+  fail = send . Fail
+  {-# INLINE fail #-}
 
 
 ------------------------------------------------------------------------------
 -- | This instance will only lift 'IO' actions. If you want to lift into some
 -- other 'MonadIO' type, use this instance, and handle it via the
--- 'Polysemy.IO.runIO' interpretation.
-instance (Member (Lift IO) r) => MonadIO (Sem r) where
-  liftIO = sendM
+-- 'Polysemy.IO.embedToMonadIO' interpretation.
+instance (Member (Embed IO) r) => MonadIO (Sem r) where
+  liftIO = embed
   {-# INLINE liftIO #-}
 
 instance Member Fixpoint r => MonadFix (Sem r) where
@@ -252,24 +310,44 @@ hoistSem
 hoistSem nat (Sem m) = Sem $ \k -> m $ \u -> k $ nat u
 {-# INLINE hoistSem #-}
 
+
 ------------------------------------------------------------------------------
 -- | Introduce an effect into 'Sem'. Analogous to
 -- 'Control.Monad.Class.Trans.lift' in the mtl ecosystem
 raise :: ∀ e r a. Sem r a -> Sem (e ': r) a
-raise = hoistSem $ hoist raise_b . weaken
+raise = hoistSem $ hoist raise . weaken
 {-# INLINE raise #-}
-
-
-raise_b :: Sem r a -> Sem (e ': r) a
-raise_b = raise
-{-# NOINLINE raise_b #-}
 
 
 ------------------------------------------------------------------------------
 -- | Like 'raise', but introduces a new effect underneath the head of the
 -- list.
+--
+-- 'raiseUnder' can be used in order to turn transformative interpreters
+-- into reinterpreters. This is especially useful if you're writing an interpreter
+-- which introduces an intermediary effect, and then want to use an existing
+-- interpreter on that effect.
+--
+-- For example, given:
+--
+-- @
+-- fooToBar :: 'Member' Bar r => 'Sem' (Foo ': r) a -> 'Sem' r a
+-- runBar   :: 'Sem' (Bar ': r) a -> 'Sem' r a
+-- @
+--
+-- You can write:
+--
+-- @
+-- runFoo :: 'Sem' (Foo ': r) a -> 'Sem' r a
+-- runFoo =
+--     runBar     -- Consume Bar
+--   . fooToBar   -- Interpret Foo in terms of the new Bar
+--   . 'raiseUnder' -- Introduces Bar under Foo
+-- @
+--
+-- @since 1.2.0.0
 raiseUnder :: ∀ e2 e1 r a. Sem (e1 ': r) a -> Sem (e1 ': e2 ': r) a
-raiseUnder = hoistSem $ hoist raiseUnder_b . weakenUnder
+raiseUnder = hoistSem $ hoist raiseUnder . weakenUnder
   where
     weakenUnder :: ∀ m x. Union (e1 ': r) m x -> Union (e1 ': e2 ': r) m x
     weakenUnder (Union SZ a) = Union SZ a
@@ -278,16 +356,13 @@ raiseUnder = hoistSem $ hoist raiseUnder_b . weakenUnder
 {-# INLINE raiseUnder #-}
 
 
-raiseUnder_b :: Sem (e1 ': r) a -> Sem (e1 ': e2 ': r) a
-raiseUnder_b = raiseUnder
-{-# NOINLINE raiseUnder_b #-}
-
-
 ------------------------------------------------------------------------------
 -- | Like 'raise', but introduces two new effects underneath the head of the
 -- list.
+--
+-- @since 1.2.0.0
 raiseUnder2 :: ∀ e2 e3 e1 r a. Sem (e1 ': r) a -> Sem (e1 ': e2 ': e3 ': r) a
-raiseUnder2 = hoistSem $ hoist raiseUnder2_b . weakenUnder2
+raiseUnder2 = hoistSem $ hoist raiseUnder2 . weakenUnder2
   where
     weakenUnder2 ::  ∀ m x. Union (e1 ': r) m x -> Union (e1 ': e2 ': e3 ': r) m x
     weakenUnder2 (Union SZ a) = Union SZ a
@@ -296,16 +371,13 @@ raiseUnder2 = hoistSem $ hoist raiseUnder2_b . weakenUnder2
 {-# INLINE raiseUnder2 #-}
 
 
-raiseUnder2_b :: Sem (e1 ': r) a -> Sem (e1 ': e2 ': e3 ': r) a
-raiseUnder2_b = raiseUnder2
-{-# NOINLINE raiseUnder2_b #-}
-
-
 ------------------------------------------------------------------------------
 -- | Like 'raise', but introduces two new effects underneath the head of the
 -- list.
+--
+-- @since 1.2.0.0
 raiseUnder3 :: ∀ e2 e3 e4 e1 r a. Sem (e1 ': r) a -> Sem (e1 ': e2 ': e3 ': e4 ': r) a
-raiseUnder3 = hoistSem $ hoist raiseUnder3_b . weakenUnder3
+raiseUnder3 = hoistSem $ hoist raiseUnder3 . weakenUnder3
   where
     weakenUnder3 ::  ∀ m x. Union (e1 ': r) m x -> Union (e1 ': e2 ': e3 ': e4 ': r) m x
     weakenUnder3 (Union SZ a) = Union SZ a
@@ -313,14 +385,23 @@ raiseUnder3 = hoistSem $ hoist raiseUnder3_b . weakenUnder3
     {-# INLINE weakenUnder3 #-}
 {-# INLINE raiseUnder3 #-}
 
-
-raiseUnder3_b :: Sem (e1 ': r) a -> Sem (e1 ': e2 ': e3 ': e4 ': r) a
-raiseUnder3_b = raiseUnder3
-{-# NOINLINE raiseUnder3_b #-}
-
+------------------------------------------------------------------------------
+-- | Interprets an effect in terms of another identical effect.
+--
+-- This is useful for defining interpreters that use 'Polysemy.reinterpretH'
+-- without immediately consuming the newly introduced effect.
+-- Using such an interpreter recursively may result in duplicate effects,
+-- which may then be eliminated using 'subsume'.
+--
+-- @since 1.2.0.0
+subsume :: Member e r => Sem (e ': r) a -> Sem r a
+subsume = hoistSem $ \u -> hoist subsume $ case decomp u of
+  Right w -> injWeaving w
+  Left  g -> g
+{-# INLINE subsume #-}
 
 ------------------------------------------------------------------------------
--- | Lift an effect into a 'Sem'. This is used primarily via
+-- | Embed an effect into a 'Sem'. This is used primarily via
 -- 'Polysemy.makeSem' to implement smart constructors.
 send :: Member e r => e (Sem r) a -> Sem r a
 send = liftSem . inj
@@ -328,10 +409,12 @@ send = liftSem . inj
 
 
 ------------------------------------------------------------------------------
--- | Lift a monadic action @m@ into 'Sem'.
-sendM :: Member (Lift m) r => m a -> Sem r a
-sendM = send . Lift
-{-# INLINE sendM #-}
+-- | Embed a monadic action @m@ in 'Sem'.
+--
+-- @since 1.0.0.0
+embed :: Member (Embed m) r => m a -> Sem r a
+embed = send . Embed
+{-# INLINE embed #-}
 
 
 ------------------------------------------------------------------------------
@@ -344,25 +427,36 @@ run (Sem m) = runIdentity $ m absurdU
 ------------------------------------------------------------------------------
 -- | Lower a 'Sem' containing only a single lifted 'Monad' into that
 -- monad.
-runM :: Monad m => Sem '[Lift m] a -> m a
+runM :: Monad m => Sem '[Embed m] a -> m a
 runM (Sem m) = m $ \z ->
   case extract z of
-    Yo e s _ f _ -> do
-      a <- unLift e
+    Weaving e s _ f _ -> do
+      a <- unEmbed e
       pure $ f $ a <$ s
 {-# INLINE runM #-}
 
+------------------------------------------------------------------------------
+-- | Type synonym for interpreters that consume an effect without changing the 
+-- return value. Offered for user convenience. 
+--
+-- @r@ Is kept polymorphic so it's possible to place constraints upon it:
+--
+-- @
+-- teletypeToIO :: 'Member' (Embed IO) r
+--              => 'InterpreterFor' Teletype r
+-- @
+type InterpreterFor e r = forall a. Sem (e ': r) a -> Sem r a
 
 ------------------------------------------------------------------------------
 -- | Some interpreters need to be able to lower down to the base monad (often
 -- 'IO') in order to function properly --- some good examples of this are
--- 'Polysemy.Error.runErrorInIO' and 'Polysemy.Resource.runResourceInIO'.
+-- 'Polysemy.Error.lowerError' and 'Polysemy.Resource.lowerResource'.
 --
 -- However, these interpreters don't compose particularly nicely; for example,
--- to run 'Polysemy.Resource.runResourceInIO', you must write:
+-- to run 'Polysemy.Resource.lowerResource', you must write:
 --
 -- @
--- runM . runErrorInIO runM
+-- runM . lowerError runM
 -- @
 --
 -- Notice that 'runM' is duplicated in two places here. The situation gets
@@ -372,7 +466,7 @@ runM (Sem m) = m $ \z ->
 -- Instead, '.@' performs the composition we'd like. The above can be written as
 --
 -- @
--- (runM .@ runErrorInIO)
+-- (runM .@ lowerError)
 -- @
 --
 -- The parentheses here are important; without them you'll run into operator
@@ -382,6 +476,11 @@ runM (Sem m) = m $ \z ->
 -- just for initialization. This can result in rather surprising behavior. For
 -- a version of '.@' that won't duplicate work, see the @.\@!@ operator in
 -- <http://hackage.haskell.org/package/polysemy-zoo/docs/Polysemy-IdempotentLowering.html polysemy-zoo>.
+--
+-- Interpreters using 'Polysemy.Final' may be composed normally, and
+-- avoid the work duplication issue. For that reason, you're encouraged to use
+-- @-'Polysemy.Final'@ interpreters instead of @lower-@ interpreters whenever
+-- possible.
 (.@)
     :: Monad m
     => (∀ x. Sem r x -> m x)
@@ -397,7 +496,7 @@ infixl 8 .@
 
 ------------------------------------------------------------------------------
 -- | Like '.@', but for interpreters which change the resulting type --- eg.
--- 'Polysemy.Error.runErrorInIO'.
+-- 'Polysemy.Error.lowerError'.
 (.@@)
     :: Monad m
     => (∀ x. Sem r x -> m x)

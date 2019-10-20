@@ -7,13 +7,31 @@ module Polysemy
   -- * Running Sem
   , run
   , runM
+  , runFinal
+
+  -- * Type synonyms for user convenience
+  , InterpreterFor
 
   -- * Interoperating With Other Monads
-  , Lift (..)
-  , sendM
+  -- ** Embed
+  , Embed (..)
+  , embed
+  , embedToFinal
+
+  -- ** Final
+  -- | For advanced uses of 'Final', including creating your own interpreters
+  -- that make use of it, see "Polysemy.Final"
+  , Final
+  , embedFinal
 
     -- * Lifting
   , raise
+  , raiseUnder
+  , raiseUnder2
+  , raiseUnder3
+
+    -- * Trivial Interpretation
+  , subsume
 
     -- * Creating New Effects
     -- | Effects should be defined as a GADT (enable @-XGADTs@), with kind @(*
@@ -27,8 +45,8 @@ module Polysemy
     --   ReadLine  :: Console m String
     -- @
     --
-    -- Notice that the @a@ parameter gets instataniated at the /desired return
-    -- type/ of the actions. Writing a line returns a '()', but reading one
+    -- Notice that the @a@ parameter gets instantiated at the /desired return/
+    -- /type/ of the actions. Writing a line returns a @()@, but reading one
     -- returns 'String'.
     --
     -- By enabling @-XTemplateHaskell@, we can use the 'makeSem' function
@@ -88,6 +106,9 @@ module Polysemy
   , reinterpret2H
   , reinterpret3H
 
+    -- * Combinators for Interpreting Directly to IO
+  , withLowerToIO
+
     -- * Kind Synonyms
   , Effect
   , EffectRow
@@ -115,9 +136,11 @@ module Polysemy
   , Inspector (..)
   ) where
 
+import Polysemy.Final
 import Polysemy.Internal
 import Polysemy.Internal.Combinators
+import Polysemy.Internal.Forklift
 import Polysemy.Internal.Kind
-import Polysemy.Internal.TH.Effect
 import Polysemy.Internal.Tactics
+import Polysemy.Internal.TH.Effect
 

@@ -10,6 +10,7 @@ module TypeErrors where
 -- >>> :m +Polysemy.Resource
 -- >>> :m +Polysemy.State
 -- >>> :m +Polysemy.Trace
+-- >>> :m +Data.Maybe
 
 
 --------------------------------------------------------------------------------
@@ -44,14 +45,12 @@ ambiguousPolyState = ()
 
 --------------------------------------------------------------------------------
 -- |
--- TODO(sandy): should this mention 'Reader i' or just 'Reader'?
---
 -- >>> :{
--- interpret @Reader $ \case
+-- interpret @(Reader Bool) $ \case
 --   Ask -> undefined
 -- :}
 -- ...
--- ... 'Reader i' is higher-order, but 'interpret' can help only
+-- ... 'Reader Bool' is higher-order, but 'interpret' can help only
 -- ... with first-order effects.
 -- ...
 -- ... 'interpretH' instead.
@@ -62,13 +61,13 @@ interpretBadFirstOrder = ()
 --------------------------------------------------------------------------------
 -- |
 -- >>> :{
--- runFoldMapOutput
+-- runOutputMonoid
 --     :: forall o m r a
 --      . Monoid m
 --     => (o -> m)
 --     -> Sem (Output o ': r) a
 --     -> Sem r (m, a)
--- runFoldMapOutput f = runState mempty . reinterpret $ \case
+-- runOutputMonoid f = runState mempty . reinterpret $ \case
 --   Output o -> modify (`mappend` f o)
 -- :}
 -- ...
@@ -86,20 +85,16 @@ tooFewArgumentsReinterpret = ()
 --     foo = pure ()
 --     foo' = reinterpretScrub foo
 --     foo'' = runState True foo'
---     foo''' = runTraceIO foo''
+--     foo''' = traceToIO foo''
 --  in runM foo'''
 -- :}
 -- ...
--- ... Ambiguous use of effect 'Lift'
+-- ... Unhandled effect 'Embed IO'
 -- ...
--- ... add (Member (Lift IO) '[]) ...
+-- ... Expected type: Sem '[Embed m] (Bool, ())
+-- ... Actual type: Sem '[] (Bool, ())
 -- ...
---
--- PROBLEM: We're trying to run more effects than exist in the eff row. This is
--- indeed a problem, but the error message isn't helpful.
---
--- SOLUTION: Add a special case to `AmbiguousSend` when `r ~ '[]`.
-runningTooManyEffects'WRONG = ()
+runningTooManyEffects = ()
 
 
 --------------------------------------------------------------------------------
@@ -111,13 +106,9 @@ runningTooManyEffects'WRONG = ()
 -- ...
 -- ... Ambiguous use of effect 'State'
 -- ...
--- ... (Member (State ()) State Int : r) ...
+-- ... (Member (State ()) (State Int : r)) ...
 -- ...
---
--- PROBLEM: There should be parentheses around `State Int : r`
---
--- SOLUTION: Emit parens only when the effect row is of the form `e1 ': ...`
-missingParens'WRONG = ()
+ambiguousSendInConcreteR = ()
 
 
 --------------------------------------------------------------------------------
@@ -125,43 +116,39 @@ missingParens'WRONG = ()
 -- >>> :{
 -- let foo :: Member Resource r => Sem r ()
 --     foo = undefined
---  in runM $ runResourceInIO foo
+--  in runM $ lowerResource foo
 -- :}
 -- ...
--- ... Ambiguous use of effect 'Lift'
+-- ... Couldn't match expected type ...
+-- ... with actual type ...
+-- ... Probable cause: ... is applied to too few arguments
 -- ...
--- ... (Member (Lift IO) r0) ...
--- ...
--- ... Could not deduce: (Member Resource r1)
--- ...
---
--- PROBLEM: This error is totally bogus. We forgot to give an argument to
--- 'runResourceInIO'. For comparison, the standard error GHC gives in this case
--- is significantly more helpful:
---
---    <interactive>:192:13: error:
---        • Couldn't match expected type ‘Sem '[Lift m] a’
---                      with actual type ‘Sem (Resource : r0) a0 -> Sem r0 a0’
---        • Probable cause: ‘runResourceInIO’ is applied to too few arguments
---          In the second argument of ‘($)’, namely ‘runResourceInIO foo’
---          In the expression: runM $ runResourceInIO foo
---          In the expression:
---            let
---              foo :: Member Resource r => Sem r ()
---              foo = undefined
---            in runM $ runResourceInIO foo
---        • Relevant bindings include
---            it :: m a (bound at <interactive>:190:2)
---    <interactive>:192:29: error:
---        • Couldn't match expected type ‘Sem r0 x -> IO x’
---                      with actual type ‘Sem r1 ()’
---        • In the first argument of ‘runResourceInIO’, namely ‘foo’
---          In the second argument of ‘($)’, namely ‘runResourceInIO foo’
---          In the expression: runM $ runResourceInIO foo
---
---
--- SOLUTION: Honestly I'm not sure!
-missingArgumentToRunResourceInIO'WRONG = ()
+missingArgumentToRunResourceInIO = ()
 
 
+--------------------------------------------------------------------------------
+-- |
+-- >>> :{
+-- existsKV :: Member (State (Maybe Int)) r => Sem r Bool
+-- existsKV = isJust get
+-- :}
+-- ...
+-- ... Ambiguous use of effect 'State'
+-- ...
+--
+-- NOTE: This is fixed by enabling the plugin!
+missingFmap'PLUGIN = ()
+
+--------------------------------------------------------------------------------
+-- |
+-- >>> :{
+-- foo :: Sem '[State Int, Embed IO] ()
+-- foo = output ()
+-- :}
+-- ...
+-- ... Unhandled effect 'Output ()'
+-- ...
+-- ... add an interpretation for 'Output ()'
+-- ...
+missingEffectInStack'WRONG = ()
 

@@ -16,10 +16,10 @@ data Teletype m a where
 
 makeSem ''Teletype
 
-runTeletypeIO :: Member (Lift IO) r => Sem (Teletype ': r) a -> Sem r a
-runTeletypeIO = interpret $ \case
-  ReadTTY      -> sendM getLine
-  WriteTTY msg -> sendM $ putStrLn msg
+teletypeToIO :: Member (Embed IO) r => Sem (Teletype ': r) a -> Sem r a
+teletypeToIO = interpret $ \case
+  ReadTTY      -> embed getLine
+  WriteTTY msg -> embed $ putStrLn msg
 
 data CustomException = ThisException | ThatException deriving Show
 
@@ -33,7 +33,13 @@ program = catch @CustomException work $ \e -> writeTTY ("Caught " ++ show e)
             _             -> writeTTY i >> writeTTY "no exceptions"
 
 foo :: IO (Either CustomException ())
-foo = (runM .@ runResourceInIO .@@ runErrorInIO @CustomException) $ runTeletypeIO program
+foo =
+    runFinal
+  . embedToFinal @IO
+  . resourceToIOFinal
+  . errorToIOFinal @CustomException
+  . teletypeToIO
+  $ program
 
 spec :: Spec
 spec = describe "example" $ do
