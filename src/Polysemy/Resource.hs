@@ -12,11 +12,14 @@ module Polysemy.Resource
 
     -- * Interpretations
   , runResource
-  , runResourceInIO
+  , resourceToIOFinal
+  , resourceToIO
+  , lowerResource
   ) where
 
 import qualified Control.Exception as X
 import           Polysemy
+import           Polysemy.Final
 
 
 ------------------------------------------------------------------------------
@@ -71,31 +74,64 @@ onException
     -> Sem r a
 onException act end = bracketOnError (pure ()) (const end) (const act)
 
+------------------------------------------------------------------------------
+-- | Run a 'Resource' effect in terms of 'X.bracket' through final 'IO'
+--
+-- /Beware/: Effects that aren't interpreted in terms of 'IO'
+-- will have local state semantics in regards to 'Resource' effects
+-- interpreted this way. See 'Final'.
+--
+-- Notably, unlike 'resourceToIO', this is not consistent with
+-- 'Polysemy.State.State' unless 'Polysemy.State.runStateInIORef' is used.
+-- State that seems like it should be threaded globally throughout 'bracket's
+-- /will not be./
+--
+-- Use 'resourceToIO' instead if you need to run
+-- pure, stateful interpreters after the interpreter for 'Resource'.
+-- (Pure interpreters are interpreters that aren't expressed in terms of
+-- another effect or monad; for example, 'Polysemy.State.runState'.)
+--
+-- @since 1.2.0.0
+resourceToIOFinal :: Member (Final IO) r
+                  => Sem (Resource ': r) a
+                  -> Sem r a
+resourceToIOFinal = interpretFinal $ \case
+  Bracket alloc dealloc use -> do
+    a <- runS  alloc
+    d <- bindS dealloc
+    u <- bindS use
+    pure $ X.bracket a d u
+
+  BracketOnError alloc dealloc use -> do
+    a <- runS  alloc
+    d <- bindS dealloc
+    u <- bindS use
+    pure $ X.bracketOnError a d u
+{-# INLINE resourceToIOFinal #-}
+
 
 ------------------------------------------------------------------------------
--- | Run a 'Resource' effect via in terms of 'X.bracket'.
+-- | Run a 'Resource' effect in terms of 'X.bracket'.
 --
--- __Note:__ This function used to be called @runResource@ prior to 0.4.0.0.
---
--- @since 0.4.0.0
-runResourceInIO
+-- @since 1.0.0.0
+lowerResource
     :: ∀ r a
-     . Member (Lift IO) r
+     . Member (Embed IO) r
     => (∀ x. Sem r x -> IO x)
        -- ^ Strategy for lowering a 'Sem' action down to 'IO'. This is likely
        -- some combination of 'runM' and other interpreters composed via '.@'.
     -> Sem (Resource ': r) a
     -> Sem r a
-runResourceInIO finish = interpretH $ \case
+lowerResource finish = interpretH $ \case
   Bracket alloc dealloc use -> do
     a <- runT  alloc
     d <- bindT dealloc
     u <- bindT use
 
     let run_it :: Sem (Resource ': r) x -> IO x
-        run_it = finish .@ runResourceInIO_b
+        run_it = finish .@ lowerResource
 
-    sendM $ X.bracket (run_it a) (run_it . d) (run_it . u)
+    embed $ X.bracket (run_it a) (run_it . d) (run_it . u)
 
   BracketOnError alloc dealloc use -> do
     a <- runT  alloc
@@ -103,15 +139,17 @@ runResourceInIO finish = interpretH $ \case
     u <- bindT use
 
     let run_it :: Sem (Resource ': r) x -> IO x
-        run_it = finish .@ runResourceInIO_b
+        run_it = finish .@ lowerResource
 
-    sendM $ X.bracketOnError (run_it a) (run_it . d) (run_it . u)
+    embed $ X.bracketOnError (run_it a) (run_it . d) (run_it . u)
+{-# INLINE lowerResource #-}
+{-# DEPRECATED lowerResource "Use 'resourceToIOFinal' instead" #-}
 
 
 ------------------------------------------------------------------------------
 -- | Run a 'Resource' effect purely.
 --
--- @since 0.4.0.0
+-- @since 1.0.0.0
 runResource
     :: ∀ r a
      . Sem (Resource ': r) a
@@ -122,7 +160,7 @@ runResource = interpretH $ \case
     d <- bindT dealloc
     u <- bindT use
 
-    let run_it = raise . runResource_b
+    let run_it = raise . runResource
     resource <- run_it a
     result <- run_it $ u resource
     _ <- run_it $ d resource
@@ -133,7 +171,7 @@ runResource = interpretH $ \case
     d <- bindT dealloc
     u <- bindT use
 
-    let run_it = raise . runResource_b
+    let run_it = raise . runResource
 
     resource <- run_it a
     result <- run_it $ u resource
@@ -147,19 +185,53 @@ runResource = interpretH $ \case
 {-# INLINE runResource #-}
 
 
-runResource_b
-    :: ∀ r a
-     . Sem (Resource ': r) a
+------------------------------------------------------------------------------
+-- | A more flexible --- though less safe ---  version of 'resourceToIOFinal'
+--
+-- This function is capable of running 'Resource' effects anywhere within an
+-- effect stack, without relying on an explicit function to lower it into 'IO'.
+-- Notably, this means that 'Polysemy.State.State' effects will be consistent
+-- in the presence of 'Resource'.
+--
+-- ResourceToIO' is safe whenever you're concerned about exceptions thrown
+-- by effects _already handled_ in your effect stack, or in 'IO' code run
+-- directly inside of 'bracket'. It is not safe against exceptions thrown
+-- explicitly at the main thread. If this is not safe enough for your use-case,
+-- use 'resourceToIOFinal' instead.
+--
+-- This function creates a thread, and so should be compiled with @-threaded@.
+--
+-- @since 1.0.0.0
+resourceToIO
+    :: forall r a
+     . Member (Embed IO) r
+    => Sem (Resource ': r) a
     -> Sem r a
-runResource_b = runResource
-{-# NOINLINE runResource_b #-}
+resourceToIO = interpretH $ \case
+  Bracket a b c -> do
+    ma <- runT a
+    mb <- bindT b
+    mc <- bindT c
 
-runResourceInIO_b
-    :: ∀ r a
-     . Member (Lift IO) r
-    => (∀ x. Sem r x -> IO x)
-    -> Sem (Resource ': r) a
-    -> Sem r a
-runResourceInIO_b = runResourceInIO
-{-# NOINLINE runResourceInIO_b #-}
+    withLowerToIO $ \lower finish -> do
+      let done :: Sem (Resource ': r) x -> IO x
+          done = lower . raise . resourceToIO
+      X.bracket
+          (done ma)
+          (\x -> done (mb x) >> finish)
+          (done . mc)
+
+  BracketOnError a b c -> do
+    ma <- runT a
+    mb <- bindT b
+    mc <- bindT c
+
+    withLowerToIO $ \lower finish -> do
+      let done :: Sem (Resource ': r) x -> IO x
+          done = lower . raise . resourceToIO
+      X.bracketOnError
+          (done ma)
+          (\x -> done (mb x) >> finish)
+          (done . mc)
+{-# INLINE resourceToIO #-}
 

@@ -1,4 +1,4 @@
-{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE BangPatterns, TemplateHaskell #-}
 
 module Polysemy.Output
   ( -- * Effect
@@ -8,13 +8,26 @@ module Polysemy.Output
   , output
 
     -- * Interpretations
-  , runFoldMapOutput
-  , runIgnoringOutput
-  , runBatchOutput
+  , runOutputList
+  , runOutputMonoid
+  , runOutputMonoidAssocR
+  , runOutputMonoidIORef
+  , runOutputMonoidTVar
+  , outputToIOMonoid
+  , outputToIOMonoidAssocR
+  , ignoreOutput
+  , runOutputBatched
+  , runOutputSem
   ) where
 
+import Data.IORef
+import Control.Concurrent.STM
+
+import Data.Semigroup (Endo(..))
+import Data.Bifunctor (first)
 import Polysemy
 import Polysemy.State
+import Control.Monad (when)
 
 
 ------------------------------------------------------------------------------
@@ -27,26 +40,156 @@ makeSem ''Output
 
 
 ------------------------------------------------------------------------------
+-- | Run an 'Output' effect by transforming it into a list of its values.
+--
+-- @since 1.0.0.0
+runOutputList
+    :: forall o r a
+     . Sem (Output o ': r) a
+    -> Sem r ([o], a)
+runOutputList = fmap (first reverse) . runState [] . reinterpret
+  (\case
+      Output o -> modify' (o :)
+  )
+{-# INLINE runOutputList #-}
+
+------------------------------------------------------------------------------
 -- | Run an 'Output' effect by transforming it into a monoid.
-runFoldMapOutput
+--
+-- @since 1.0.0.0
+runOutputMonoid
     :: forall o m r a
      . Monoid m
     => (o -> m)
     -> Sem (Output o ': r) a
     -> Sem r (m, a)
-runFoldMapOutput f = runState mempty . reinterpret
+runOutputMonoid f = runState mempty . reinterpret
   (\case
-      Output o -> modify (`mappend` f o)
+      Output o -> modify' (`mappend` f o)
   )
-{-# INLINE runFoldMapOutput #-}
+{-# INLINE runOutputMonoid #-}
 
+------------------------------------------------------------------------------
+-- | Like 'runOutputMonoid', but right-associates uses of '<>'.
+--
+-- This asymptotically improves performance if the time complexity of '<>' for
+-- the 'Monoid' depends only on the size of the first argument.
+--
+-- You should always use this instead of 'runOutputMonoid' if the monoid
+-- is a list, such as 'String'.
+--
+-- @since 1.1.0.0
+runOutputMonoidAssocR
+    :: forall o m r a
+     . Monoid m
+    => (o -> m)
+    -> Sem (Output o ': r) a
+    -> Sem r (m, a)
+runOutputMonoidAssocR f =
+    fmap (first (`appEndo` mempty))
+  . runOutputMonoid (\o -> let !o' = f o in Endo (o' <>))
+{-# INLINE runOutputMonoidAssocR #-}
+
+------------------------------------------------------------------------------
+-- | Run an 'Output' effect by transforming it into atomic operations
+-- over an 'IORef'.
+--
+-- @since 1.1.0.0
+runOutputMonoidIORef
+    :: forall o m r a
+     . (Monoid m, Member (Embed IO) r)
+    => IORef m
+    -> (o -> m)
+    -> Sem (Output o ': r) a
+    -> Sem r a
+runOutputMonoidIORef ref f = interpret $ \case
+  Output o -> embed $ atomicModifyIORef' ref (\s -> let !o' = f o in (s <> o', ()))
+{-# INLINE runOutputMonoidIORef #-}
+
+------------------------------------------------------------------------------
+-- | Run an 'Output' effect by transforming it into atomic operations
+-- over a 'TVar'.
+--
+-- @since 1.1.0.0
+runOutputMonoidTVar
+    :: forall o m r a
+     . (Monoid m, Member (Embed IO) r)
+    => TVar m
+    -> (o -> m)
+    -> Sem (Output o ': r) a
+    -> Sem r a
+runOutputMonoidTVar tvar f = interpret $ \case
+  Output o -> embed $ atomically $ do
+    s <- readTVar tvar
+    writeTVar tvar $! s <> f o
+{-# INLINE runOutputMonoidTVar #-}
+
+
+--------------------------------------------------------------------
+-- | Run an 'Output' effect in terms of atomic operations
+-- in 'IO'.
+--
+-- Internally, this simply creates a new 'IORef', passes it to
+-- 'runOutputMonoidIORef', and then returns the result and the final value
+-- of the 'IORef'.
+--
+-- /Beware/: As this uses an 'IORef' internally,
+-- all other effects will have local
+-- state semantics in regards to 'Output' effects
+-- interpreted this way.
+-- For example, 'Polysemy.Error.throw' and 'Polysemy.Error.catch' will
+-- never revert 'output's, even if 'Polysemy.Error.runError' is used
+-- after 'outputToIOMonoid'.
+--
+-- @since 1.2.0.0
+outputToIOMonoid
+  :: forall o m r a
+   . (Monoid m, Member (Embed IO) r)
+  => (o -> m)
+  -> Sem (Output o ': r) a
+  -> Sem r (m, a)
+outputToIOMonoid f sem = do
+  ref <- embed $ newIORef mempty
+  res <- runOutputMonoidIORef ref f sem
+  end <- embed $ readIORef ref
+  return (end, res)
+
+------------------------------------------------------------------------------
+-- | Like 'outputToIOMonoid', but right-associates uses of '<>'.
+--
+-- This asymptotically improves performance if the time complexity of '<>' for
+-- the 'Monoid' depends only on the size of the first argument.
+--
+-- You should always use this instead of 'outputToIOMonoid' if the monoid
+-- is a list, such as 'String'.
+--
+-- /Beware/: As this uses an 'IORef' internally,
+-- all other effects will have local
+-- state semantics in regards to 'Output' effects
+-- interpreted this way.
+-- For example, 'Polysemy.Error.throw' and 'Polysemy.Error.catch' will
+-- never revert 'output's, even if 'Polysemy.Error.runError' is used
+-- after 'outputToIOMonoidAssocR'.
+--
+-- @since 1.2.0.0
+outputToIOMonoidAssocR
+  :: forall o m r a
+   . (Monoid m, Member (Embed IO) r)
+  => (o -> m)
+  -> Sem (Output o ': r) a
+  -> Sem r (m, a)
+outputToIOMonoidAssocR f =
+    (fmap . first) (`appEndo` mempty)
+  . outputToIOMonoid (\o -> let !o' = f o in Endo (o' <>))
 
 ------------------------------------------------------------------------------
 -- | Run an 'Output' effect by ignoring it.
-runIgnoringOutput :: Sem (Output o ': r) a -> Sem r a
-runIgnoringOutput = interpret $ \case
+--
+-- @since 1.0.0.0
+ignoreOutput :: Sem (Output o ': r) a -> Sem r a
+ignoreOutput = interpret $ \case
   Output _ -> pure ()
-{-# INLINE runIgnoringOutput #-}
+{-# INLINE ignoreOutput #-}
 
 
 ------------------------------------------------------------------------------
@@ -56,31 +199,34 @@ runIgnoringOutput = interpret $ \case
 -- If @size@ is 0, this interpretation will not emit anything in the resulting
 -- 'Output' effect.
 --
--- @since 0.1.2.0
-runBatchOutput
+-- @since 1.0.0.0
+runOutputBatched
     :: forall o r a
-     . Int
-    -> Sem (Output [o] ': r) a
-    -> Sem (Output [[o]] ': r) a
-runBatchOutput 0 m = raise $ runIgnoringOutput m
-runBatchOutput size m = do
-  ((_, res), a) <-
-    runState (0 :: Int, [] :: [o]) $ reinterpret2 (\case
+     . Member (Output [o]) r
+    => Int
+    -> Sem (Output o ': r) a
+    -> Sem r a
+runOutputBatched 0 m = ignoreOutput m
+runOutputBatched size m = do
+  ((c, res), a) <-
+    runState (0 :: Int, [] :: [o]) $ reinterpret (\case
       Output o -> do
-        (nacc, acc) <- get
-        let no     = length o
-            total  = mappend acc o
-            ntotal = nacc + no
-
-            emitting n ls
-              | n >= size = do
-                  let (emit, acc') = splitAt size ls
-                  output [emit]
-                  emitting (n - size) acc'
-              | otherwise = pure (n, ls)
-        (nacc', acc') <- emitting ntotal total
-        put (nacc', acc')
+        (count, acc) <- get
+        let newCount = 1 + count
+            newAcc = o : acc
+        if newCount < size
+          then put (newCount, newAcc)
+          else do
+            output (reverse newAcc)
+            put (0 :: Int, [] :: [o])
     ) m
-  output [res]
+  when (c > 0) $ output @[o] (reverse res)
   pure a
 
+------------------------------------------------------------------------------
+-- | Runs an 'Output' effect by running a monadic action for each of its
+-- values.
+runOutputSem :: (o -> Sem r ()) -> Sem (Output o ': r) a -> Sem r a
+runOutputSem act = interpret $ \case
+    Output o -> act o
+{-# INLINE runOutputSem #-}

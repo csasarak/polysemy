@@ -1,5 +1,24 @@
 # Changelog for polysemy-plugin
 
+
+## 0.2.3.0 (2019-09-04)
+- The plugin will now choose between given effects based on the ability to unify them.
+    This makes it possible for disambiguation to kick in even when using multiple
+    instances of the same effect with different type variables,
+    as long as type annotations/applications are used to
+    target a specific instance.
+- Updated the test suite to test against `polysemy-1.2.0.0`.
+
+## 0.2.2.0 (2019-07-04)
+
+- The plugin will now prevent some false-positives in `polysemy`'s error
+    messages
+- Updated the lower bounds to `polysemy-0.6.0.0`
+
+## 0.2.1.1 (2019-06-26)
+
+- Updated the test suite to test against `polysemy-0.5.0.0`
+
 ## 0.2.1.0 (2019-06-14)
 
 - Greatly improved the plugin's ability to unify polymorphic types when running
@@ -40,5 +59,5 @@
 
 ## Unreleased changes
 
-- Added `runErrorAsAnother`
+- Added `mapError`
 

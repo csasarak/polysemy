@@ -67,6 +67,9 @@ Or by adding `-fplugin=Polysemy.Plugin` to your package.yaml/.cabal file `ghc-op
 <sup><a name="fn1">1</a></sup>: Unfortunately this is not true in GHC 8.6.3, but
 will be true in GHC 8.10.1.
 
+## Tutorial
+
+Raghu Kaippully wrote a beginner friendly [tutorial](https://haskell-explained.gitlab.io/blog/posts/2019/07/28/polysemy-is-cool-part-1/index.html).
 
 ## Examples
 
@@ -91,15 +94,15 @@ data Teletype m a where
 
 makeSem ''Teletype
 
-runTeletypeIO :: Member (Lift IO) r => Sem (Teletype ': r) a -> Sem r a
-runTeletypeIO = interpret $ \case
-  ReadTTY      -> sendM getLine
-  WriteTTY msg -> sendM $ putStrLn msg
+teletypeToIO :: Member (Embed IO) r => Sem (Teletype ': r) a -> Sem r a
+teletypeToIO = interpret $ \case
+  ReadTTY      -> embed getLine
+  WriteTTY msg -> embed $ putStrLn msg
 
 runTeletypePure :: [String] -> Sem (Teletype ': r) a -> Sem r ([String], a)
 runTeletypePure i
-  = runFoldMapOutput pure  -- For each WriteTTY in our program, consume an output by appending it to the list in a ([String], a)
-  . runListInput i         -- Treat each element of our list of strings as a line of input
+  = runOutputMonoid pure  -- For each WriteTTY in our program, consume an output by appending it to the list in a ([String], a)
+  . runInputList i         -- Treat each element of our list of strings as a line of input
   . reinterpret2 \case     -- Reinterpret our effect in terms of Input and Output
       ReadTTY -> maybe "" id <$> input
       WriteTTY msg -> output msg
@@ -120,13 +123,9 @@ echoPure = flip runTeletypePure echo
 pureOutput :: [String] -> [String]
 pureOutput = fst . run . echoPure
 
--- Now let's do things
-echoIO :: Sem '[Lift IO] ()
-echoIO = runTeletypeIO echo
-
 -- echo forever
 main :: IO ()
-main = runM echoIO
+main = runM . teletypeToIO $ echo
 ```
 
 
@@ -157,7 +156,13 @@ program = catch @CustomException work $ \e -> writeTTY ("Caught " ++ show e)
             _             -> writeTTY input >> writeTTY "no exceptions"
 
 main :: IO (Either CustomException ())
-main = (runM .@ runResourceInIO .@@ runErrorInIO @CustomException) . runTeletypeIO $ program
+main =
+    runFinal
+  . embedToFinal @IO
+  . resourceToIOFinal
+  . errorToIOFinal @CustomException
+  . teletypeToIO
+  $ program
 ```
 
 Easy.
@@ -217,6 +222,22 @@ You're going to want to stick all of this into your `package.yaml` file.
     - TypeOperators
     - TypeFamilies
 ```
+
+## Stellar Engineering - Aligning the stars to optimize `polysemy` away
+
+Several things need to be in place to fully realize our performance goals:
+
+- GHC Version
+  - GHC 8.9+
+- Your code
+  - The module you want to be optimized needs to import `Polysemy.Internal` somewhere in its dependency tree (sufficient to `import Polysemy`)
+- GHC Flags
+  - `-O` or `-O2`
+  - `-flate-specialise` (this should be automatically turned on by the plugin, but it's worth mentioning)
+- Plugin
+  - `-fplugin=Polysemy.Plugin`
+- Additional concerns:
+  - additional core passes (turned on by the plugin)
 
 ## Want to experiment with Polysemy or base your project off of it?
 

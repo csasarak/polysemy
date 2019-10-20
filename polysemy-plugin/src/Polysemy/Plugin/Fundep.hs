@@ -1,9 +1,10 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE ViewPatterns               #-}
 
 ------------------------------------------------------------------------------
 -- The MIT License (MIT)
 --
--- Copyright (c) 2017 Luka Horvat
+-- Copyright (c) 2017 Luka Horvat, 2019 Sandy Maguire
 --
 -- Permission is hereby granted, free of charge, to any person obtaining a copy
 -- of this software and associated documentation files (the "Software"), to
@@ -25,197 +26,215 @@
 --
 ------------------------------------------------------------------------------
 --
--- This module is heavily based on 'Control.Effects.Plugin' from the
--- 'simple-effects' package, originally by Luka Horvat.
+-- This module was originally based on 'Control.Effects.Plugin' from the
+-- 'simple-effects' package, by Luka Horvat.
 --
 -- https://gitlab.com/LukaHorvat/simple-effects/commit/966ce80b8b5777a4bd8f87ffd443f5fa80cc8845#f51c1641c95dfaa4827f641013f8017e8cd02aab
 
 module Polysemy.Plugin.Fundep (fundepPlugin) where
 
-import           Class
-import           CoAxiom
-import           Control.Applicative
 import           Control.Monad
 import           Data.Bifunctor
-import           Data.Bool
-import           Data.Function (on)
+import           Data.Coerce
 import           Data.IORef
-import           Data.List
+import qualified Data.Map as M
 import           Data.Maybe
 import qualified Data.Set as S
-import           FastString (fsLit)
-import           GHC (ModuleName)
-import           GHC.TcPluginM.Extra (lookupModule, lookupName)
-import           Module (mkModuleName)
-import           OccName (mkTcOcc)
-import           TcPluginM (TcPluginM, tcLookupClass, tcPluginIO)
+import           Polysemy.Plugin.Fundep.Stuff
+import           Polysemy.Plugin.Fundep.Unification
+import           Polysemy.Plugin.Fundep.Utils
+import           TcEvidence
+import           TcPluginM (TcPluginM, tcPluginIO)
 import           TcRnTypes
 import           TcSMonad hiding (tcLookupClass)
-import           TyCoRep (Type (..))
 import           Type
 
 
-polysemyInternalUnion :: ModuleName
-polysemyInternalUnion = mkModuleName "Polysemy.Internal.Union"
 
 fundepPlugin :: TcPlugin
 fundepPlugin = TcPlugin
-    { tcPluginInit = do
-        md <- lookupModule polysemyInternalUnion (fsLit "polysemy")
-        monadEffectTcNm <- lookupName md (mkTcOcc "Find")
-        (,) <$> tcPluginIO (newIORef S.empty)
-            <*> tcLookupClass monadEffectTcNm
-    , tcPluginSolve = solveFundep
-    , tcPluginStop = const (return ()) }
+  { tcPluginInit =
+      (,) <$> tcPluginIO (newIORef S.empty)
+          <*> polysemyStuff
+  , tcPluginSolve = solveFundep
+  , tcPluginStop = const $ pure ()
+  }
 
-allMonadEffectConstraints :: Class -> [Ct] -> [(CtLoc, (Type, Type, Type))]
-allMonadEffectConstraints cls cts =
-    [ (ctLoc cd, (effName, eff, r))
-    | cd@CDictCan{cc_class = cls', cc_tyargs = [_, r, eff]} <- cts
-    , cls == cls'
-    , let effName = getEffName eff
-    ]
 
-singleListToJust :: [a] -> Maybe a
-singleListToJust [a] = Just a
-singleListToJust _ = Nothing
+------------------------------------------------------------------------------
+-- | Corresponds to a 'Polysemy.Internal.Union.Find' constraint. For example,
+-- given @Member (State s) r@, we would get:
+data FindConstraint = FindConstraint
+  { fcLoc        :: CtLoc
+  , fcEffectName :: Type  -- ^ @State@
+  , fcEffect     :: Type  -- ^ @State s@
+  , fcRow        :: Type  -- ^ @r@
+  }
 
-findMatchingEffectIfSingular :: (Type, Type, Type) -> [(Type, Type, Type)] -> Maybe Type
-findMatchingEffectIfSingular (effName, _, mon) ts = singleListToJust
-    [ eff'
-        | (effName', eff', mon') <- ts
-        , eqType effName effName'
-        , eqType mon mon' ]
 
+------------------------------------------------------------------------------
+-- | Given a list of constraints, filter out the 'FindConstraint's.
+getFindConstraints :: PolysemyStuff 'Things -> [Ct] -> [FindConstraint]
+getFindConstraints (findClass -> cls) cts = do
+  cd@CDictCan{cc_class = cls', cc_tyargs = [_, r, eff]} <- cts
+  guard $ cls == cls'
+  pure $ FindConstraint
+    { fcLoc = ctLoc cd
+    , fcEffectName = getEffName eff
+    , fcEffect = eff
+    , fcRow = r
+    }
+
+
+------------------------------------------------------------------------------
+-- | If there's only a single @Member@ in the same @r@ whose effect name
+-- matches and could possibly unify, return its effect (including tyvars.)
+findMatchingEffectIfSingular
+    :: FindConstraint
+    -> [FindConstraint]
+    -> Maybe Type
+findMatchingEffectIfSingular (FindConstraint _ eff_name wanted r) ts =
+  singleListToJust $ do
+    FindConstraint _ eff_name' eff' r' <- ts
+    guard $ eqType eff_name eff_name'
+    guard $ eqType r r'
+    guard $ canUnifyRecursive FunctionDef wanted eff'
+    pure eff'
+
+
+------------------------------------------------------------------------------
+-- | Given an effect, compute its effect name.
 getEffName :: Type -> Type
 getEffName t = fst $ splitAppTys t
 
 
-canUnifyRecursive :: SolveContext -> Type -> Type -> Bool
-canUnifyRecursive solve_ctx = go True
+------------------------------------------------------------------------------
+-- | Generate a wanted unification for the effect described by the
+-- 'FindConstraint' and the given effect.
+mkWantedForce
+  :: FindConstraint
+  -> Type
+  -> TcPluginM (Unification, Ct)
+mkWantedForce fc given = do
+  (ev, _) <- unsafeTcPluginTcM
+           . runTcSDeriveds
+           $ newWantedEq (fcLoc fc) Nominal wanted given
+  pure ( Unification (OrdType wanted) (OrdType given)
+       , CNonCanonical ev
+       )
   where
-    -- It's only OK to solve a polymorphic "given" if we're in the context of
-    -- an interpreter, because it's not really a given!
-    poly_given_ok :: Bool
-    poly_given_ok =
-      case solve_ctx of
-        InterpreterUse _ -> True
-        FunctionDef      -> False
-
-    -- On the first go around, we don't want to unify effects with tyvars, but
-    -- we _do_ want to unify their arguments, thus 'is_first'.
-    go :: Bool -> Type -> Type -> Bool
-    go is_first wanted given =
-      let (w, ws) = splitAppTys wanted
-          (g, gs) = splitAppTys given
-       in (&& bool (canUnify poly_given_ok) eqType is_first w g)
-        . flip all (zip ws gs)
-        $ \(wt, gt) -> canUnify poly_given_ok wt gt || go False wt gt
-
-
-canUnify :: Bool -> Type -> Type -> Bool
-canUnify poly_given_ok wt gt =
-  or [ isTyVarTy wt
-     , isTyVarTy gt && poly_given_ok
-     , eqType wt gt
-     ]
-
+    wanted = fcEffect fc
 
 ------------------------------------------------------------------------------
--- | Like 'Control.Monad.when', but in the context of an 'Alternative'.
-whenA
-    :: (Monad m, Alternative z)
-    => Bool
-    -> m a
-    -> m (z a)
-whenA False _ = pure empty
-whenA True ma = fmap pure ma
-
-
+-- | Generate a wanted unification for the effect described by the
+-- 'FindConstraint' and the given effect --- if they can be unified in this
+-- context.
 mkWanted
-    :: SolveContext
-    -> CtLoc
-    -> Type
-    -> Type
-    -> TcPluginM (Maybe ( (OrdType, OrdType)  -- the types we want to unify
-                        , Ct                  -- the constraint
-                        ))
-mkWanted solve_ctx loc wanted given =
-  whenA (not (mustUnify solve_ctx) || canUnifyRecursive solve_ctx wanted given) $ do
-    (ev, _) <- unsafeTcPluginTcM
-             . runTcSDeriveds
-             $ newWantedEq loc Nominal wanted given
-    pure ( (OrdType wanted, OrdType given)
-         , CNonCanonical ev
-         )
-
-thd :: (a, b, c) -> c
-thd (_, _, c) = c
-
-countLength :: (a -> a -> Bool) -> [a] -> [(a, Int)]
-countLength eq as =
-  let grouped = groupBy eq as
-   in zipWith (curry $ bimap head length) grouped grouped
+    :: FindConstraint
+    -> SolveContext
+    -> Type  -- ^ The given effect.
+    -> TcPluginM (Maybe (Unification, Ct))
+mkWanted fc solve_ctx given =
+  whenA (not (mustUnify solve_ctx) || canUnifyRecursive solve_ctx wanted given) $
+    mkWantedForce fc given
+  where
+    wanted = fcEffect fc
 
 
 ------------------------------------------------------------------------------
--- | 'Type's don't have 'Eq' or 'Ord' instances by default, even though there
--- are functions in GHC that implement these operations. This newtype gives us
--- those instances.
-newtype OrdType = OrdType
-  { getOrdType :: Type
-  }
-
-instance Eq OrdType where
-  (==) = eqType `on` getOrdType
-
-instance Ord OrdType where
-  compare = nonDetCmpType `on` getOrdType
+-- | Given a list of 'Ct's, find any that are of the form
+-- @[Irred] Sem r a ~ Something@, and return their @r@s.
+getBogusRs :: PolysemyStuff 'Things -> [Ct] -> [Type]
+getBogusRs stuff wanteds = do
+  CIrredCan ct _ <- wanteds
+  (_, [_, _, a, b]) <- pure . splitAppTys $ ctev_pred ct
+  maybeToList (extractRowFromSem stuff a)
+    ++ maybeToList (extractRowFromSem stuff b)
 
 
 ------------------------------------------------------------------------------
--- | The context in which we're attempting to solve a constraint.
-data SolveContext
-  = -- | In the context of a function definition.
-    FunctionDef
-    -- | In the context of running an interpreter. The 'Bool' corresponds to
-    -- whether we are only trying to solve a single 'Member' constraint right
-    -- now. If so, we *must* produce a unification wanted.
-  | InterpreterUse Bool
-  deriving (Eq, Ord, Show)
+-- | Take the @r@ out of @Sem r a@.
+extractRowFromSem :: PolysemyStuff 'Things -> Type -> Maybe Type
+extractRowFromSem (semTyCon -> sem) ty = do
+  (tycon, [r, _]) <- splitTyConApp_maybe ty
+  guard $ tycon == sem
+  pure r
 
-mustUnify :: SolveContext -> Bool
-mustUnify FunctionDef = True
-mustUnify (InterpreterUse b) = b
+
+------------------------------------------------------------------------------
+-- | Given a list of bogus @r@s, and the wanted constraints, produce bogus
+-- evidence terms that will prevent @IfStuck (IndexOf r _) _ _@ error messsages.
+solveBogusError :: PolysemyStuff 'Things -> [Ct] -> [(EvTerm, Ct)]
+solveBogusError stuff wanteds = do
+  let splitTyConApp_list = maybeToList  . splitTyConApp_maybe
+
+  let bogus = getBogusRs stuff wanteds
+  ct@(CIrredCan ce _) <- wanteds
+  (stuck, [_, _, expr, _, _]) <- splitTyConApp_list $ ctev_pred ce
+  guard $ stuck == ifStuckTyCon stuff
+  (idx, [_, r, _]) <- splitTyConApp_list expr
+  guard $ idx == indexOfTyCon stuff
+  guard $ elem @[] (OrdType r) $ coerce bogus
+  pure (error "bogus proof for stuck type family", ct)
+
+
+------------------------------------------------------------------------------
+-- | Determine if there is exactly one wanted find for the @r@ in question.
+exactlyOneWantedForR
+    :: [FindConstraint]  -- ^ Wanted finds
+    -> Type              -- ^ Effect row
+    -> Bool
+exactlyOneWantedForR wanteds
+    = fromMaybe False
+    . flip M.lookup singular_r
+    . OrdType
+  where
+    singular_r = M.fromList
+               -- TODO(sandy): Nothing fails if this is just @second (const
+               -- True)@. Why not? Incomplete test suite, or doing too much
+               -- work?
+               . fmap (second (/= 1))
+               . countLength
+               $ fmap (OrdType . fcRow) wanteds
 
 
 solveFundep
-    :: (IORef (S.Set (OrdType, OrdType)), Class)
+    :: ( IORef (S.Set Unification)
+       , PolysemyStuff 'Things
+       )
     -> [Ct]
     -> [Ct]
     -> [Ct]
     -> TcPluginM TcPluginResult
 solveFundep _ _ _ [] = pure $ TcPluginOk [] []
-solveFundep (ref, effCls) giv _ want = do
-    let wantedEffs = allMonadEffectConstraints effCls want
-        givenEffs = snd <$> allMonadEffectConstraints effCls giv
-        num_wanteds_by_r = countLength eqType $ fmap (thd . snd) wantedEffs
-        must_unify r =
-          let Just num_wanted = find (eqType r . fst) num_wanteds_by_r
-           in snd num_wanted /= 1
+solveFundep (ref, stuff) given _ wanted = do
+  let wanted_finds = getFindConstraints stuff wanted
+      given_finds  = getFindConstraints stuff given
 
-    eqs <- forM wantedEffs $ \(loc, e@(_, eff, r)) -> do
-      case findMatchingEffectIfSingular e givenEffs of
-        Nothing -> do
-          case splitAppTys r of
-            (_, [_, eff', _]) -> mkWanted (InterpreterUse $ must_unify r) loc eff eff'
-            _                 -> pure Nothing
-        Just eff' -> mkWanted FunctionDef loc eff eff'
+  eqs <- forM wanted_finds $ \fc -> do
+    let r  = fcRow fc
+    case findMatchingEffectIfSingular fc given_finds of
+      -- We found a real given, therefore we are in the context of a function
+      -- with an explicit @Member e r@ constraint. We also know it can
+      -- be unified (although it may generate unsatisfiable constraints).
+      Just eff' -> Just <$> mkWantedForce fc eff'
 
-    already_emitted <- tcPluginIO $ readIORef ref
-    let new_wanteds = filter (not . flip S.member already_emitted . fst)
-                    $ catMaybes eqs
+      -- Otherwise, check to see if @r ~ (e ': r')@. If so, pretend we're
+      -- trying to solve a given @Member e r@. But this can only happen in the
+      -- context of an interpreter!
+      Nothing ->
+        case splitAppTys r of
+          (_, [_, eff', _]) ->
+            mkWanted fc
+                     (InterpreterUse $ exactlyOneWantedForR wanted_finds r)
+                     eff'
+          _ -> pure Nothing
 
-    tcPluginIO $ modifyIORef ref $ S.union $ S.fromList $ fmap fst new_wanteds
-    pure . TcPluginOk [] $ fmap snd new_wanteds
+  -- We only want to emit a unification wanted once, otherwise a type error can
+  -- force the type checker to loop forever.
+  already_emitted <- tcPluginIO $ readIORef ref
+  let (unifications, new_wanteds) = unzipNewWanteds already_emitted $ catMaybes eqs
+  tcPluginIO $ modifyIORef ref $ S.union $ S.fromList unifications
+
+  pure $ TcPluginOk (solveBogusError stuff wanted) new_wanteds
 
